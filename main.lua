@@ -1,4 +1,6 @@
 --- @since 25.12.29
+--- mega-mount.yazi - A mount manager for Yazi
+--- Forked from yazi-rs/plugins:mount
 
 
 
@@ -22,8 +24,8 @@ local load_config = ya.sync(function(self)
 end)
 
 local subscribe = ya.sync(function(self)
-	ps.unsub("mount")
-	ps.sub("mount", function() ya.emit("plugin", { self._id, "refresh" }) end)
+	ps.unsub("mega-mount")
+	ps.sub("mega-mount", function() ya.emit("plugin", { self._id, "refresh" }) end)
 end)
 
 local update_partitions = ya.sync(function(self, partitions)
@@ -504,7 +506,7 @@ function M:redraw()
 			:area(self._area)
 			:type(ui.Border.ROUNDED)
 			:style(ui.Style():fg("blue"))
-			:title(ui.Line("Mount"):align(ui.Align.CENTER)),
+			:title(ui.Line("Mega Mount"):align(ui.Align.CENTER)),
 		ui.Table(rows)
 			:area(self._table_area)
 			:header(ui.Row({ "Src", "Label", "Dist", "FSType" }):style(ui.Style():bold()))
@@ -578,7 +580,6 @@ function M.should_filter(partition, root_drive)
 	end
 
 	-- Check excluded filesystem types
-	local config = get_config()
 	if partition.fstype then
 		for _, fstype in ipairs(config.filter_opts.exclude_fstypes) do
 			if partition.fstype == fstype then
@@ -588,7 +589,6 @@ function M.should_filter(partition, root_drive)
 	end
 
 	-- Check excluded device patterns
-	local config = get_config()
 	for _, pattern in ipairs(config.filter_opts.exclude_devices) do
 		if partition.src and partition.src:match(pattern) then
 			return true
@@ -769,7 +769,7 @@ function M.operate_disk(type, disk)
 			end
 
 			if has_mountable and all_mounted then
-				ya.notify { title = "Mount", content = "Disk `" .. disk.src .. "` is already mounted", timeout = 5, level = "warn" }
+				ya.notify { title = "Mega Mount", content = "Disk `" .. disk.src .. "` is already mounted", timeout = 5, level = "warn" }
 				return
 			end
 
@@ -805,7 +805,7 @@ function M.operate_disk(type, disk)
 				end
 				return nav_path
 			else
-				ya.notify { title = "Mount", content = "No mountable partitions found on `" .. disk.src .. "`", timeout = 5, level = "warn" }
+				ya.notify { title = "Mega Mount", content = "No mountable partitions found on `" .. disk.src .. "`", timeout = 5, level = "warn" }
 				return nil
 			end
 		elseif type == "unmount" then
@@ -819,7 +819,7 @@ function M.operate_disk(type, disk)
 			end
 
 			if not any_mounted then
-				ya.notify { title = "Mount", content = "Disk `" .. disk.src .. "` is already unmounted", timeout = 5, level = "warn" }
+				ya.notify { title = "Mega Mount", content = "Disk `" .. disk.src .. "` is already unmounted", timeout = 5, level = "warn" }
 				return
 			end
 
@@ -867,10 +867,10 @@ function M.operate(type)
 
 	-- Check if partition is already in the desired state
 	if type == "mount" and active.dist then
-		ya.notify { title = "Mount", content = "Partition `" .. active.src .. "` is already mounted", timeout = 5, level = "warn" }
+		ya.notify { title = "Mega Mount", content = "Partition `" .. active.src .. "` is already mounted", timeout = 5, level = "warn" }
 		return nil
 	elseif type == "unmount" and not active.dist then
-		ya.notify { title = "Mount", content = "Partition `" .. active.src .. "` is already unmounted", timeout = 5, level = "warn" }
+		ya.notify { title = "Mega Mount", content = "Partition `" .. active.src .. "` is already unmounted", timeout = 5, level = "warn" }
 		return nil
 	end
 
@@ -923,7 +923,7 @@ function M.operate(type)
 	return nil
 end
 
-function M.fail(...) ya.notify { title = "Mount", content = string.format(...), timeout = 10, level = "error" } end
+function M.fail(...) ya.notify { title = "Mega Mount", content = string.format(...), timeout = 10, level = "error" } end
 
 function M:click() end
 
