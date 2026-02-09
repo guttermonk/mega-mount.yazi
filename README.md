@@ -37,6 +37,32 @@ Or manually clone to your Yazi plugins directory:
 git clone https://github.com/guttermonk/mega-mount.yazi.git ~/.config/yazi/plugins/mega-mount.yazi
 ```
 
+### Nix Flake
+
+Add to your flake inputs:
+
+```nix
+{
+  inputs = {
+    mega-mount-yazi.url = "github:guttermonk/mega-mount.yazi";
+  };
+}
+```
+
+Then add the plugin to your Yazi configuration:
+
+```nix
+{ inputs, pkgs, ... }:
+{
+  programs.yazi = {
+    enable = true;
+    plugins = {
+      mega-mount = inputs.mega-mount-yazi.packages.${pkgs.system}.default;
+    };
+  };
+}
+```
+
 ## Usage
 
 Add this to your `~/.config/yazi/keymap.toml`:

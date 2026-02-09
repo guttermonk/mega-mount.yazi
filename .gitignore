@@ -10,3 +10,8 @@
 
 # Lua
 *.luac
+
+# Nix
+result
+result-*
+.direnv/
