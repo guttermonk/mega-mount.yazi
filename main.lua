@@ -23,10 +23,20 @@ local load_config = ya.sync(function(self)
 	return self.saved_config
 end)
 
+-- `mount` is Yazi's built-in event, published whenever /proc/mounts or
+-- /proc/partitions changes -- the latter covers inserting a drive that isn't
+-- mounted yet. Subscribing to any other name would never fire.
 local subscribe = ya.sync(function(self)
-	ps.unsub("mega-mount")
-	ps.sub("mega-mount", function() ya.emit("plugin", { self._id, "refresh" }) end)
+	ps.unsub("mount")
+	ps.sub("mount", function() ya.emit("plugin", { self._id, "refresh" }) end)
 end)
+
+-- Maps each drive attached the last time we looked to whether it's removable,
+-- so insertions can be told apart from drives that were already there. An
+-- absent key means "never seen"; `false` means "seen, and not removable".
+local save_seen = ya.sync(function(self, seen) self.seen_drives = seen end)
+
+local load_seen = ya.sync(function(self) return self.seen_drives end)
 
 local update_partitions = ya.sync(function(self, partitions)
 	self.partitions = partitions
@@ -64,6 +74,16 @@ local M = {
 		dir = nil, -- defaults to $HOME
 	},
 	show_help = true,
+	notify_opts = {
+		-- Announce newly inserted removable drives
+		enabled = true,
+		-- Key to suggest in the message; there's no API to read keymap.toml,
+		-- so it has to be told to us
+		keybind = nil,
+		-- Also announce drives that show up already mounted (e.g. automounted
+		-- by udisks), which need no action
+		mounted = false,
+	},
 	filter_opts = {
 		-- Filter out partitions mounted at these paths
 		exclude_mounts = { "/", "/boot", "/boot/efi" },
@@ -134,7 +154,10 @@ local function get_config()
 		-- Restore config from sync context
 		M.symlink_opts = saved.symlink_opts or M.symlink_opts
 		M.filter_opts = saved.filter_opts or M.filter_opts
-		M.show_help = saved.show_help ~= nil and saved.show_help or M.show_help
+		M.notify_opts = saved.notify_opts or M.notify_opts
+		if saved.show_help ~= nil then
+			M.show_help = saved.show_help
+		end
 		if saved.user_keys then
 			M.user_keys = saved.user_keys
 			-- Rebuild keymap with restored user keys
@@ -155,6 +178,23 @@ local function sanitize_name(name)
 	end
 	-- Replace slashes and null bytes with underscores, trim whitespace
 	return name:gsub("[/%z]", "_"):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+-- /dev/sdb1 -> sdb1
+local function device_basename(src)
+	return src and (src:match("^/dev/(.+)$") or src) or "drive"
+end
+
+-- What to call a partition in messages: its volume label if it has one
+local function display_name(partition)
+	if partition.label and partition.label ~= "" then
+		return partition.label
+	end
+	return device_basename(partition.src)
+end
+
+local function notify_ok(fmt, ...)
+	ya.notify { title = "Mega Mount", content = string.format(fmt, ...), timeout = 5 }
 end
 
 local function get_symlink_name(partition)
@@ -257,6 +297,146 @@ local function remove_symlink(partition)
 	end
 end
 
+-- Collect the rows `obtain()` produced into one entry per physical drive, so a
+-- stick with several partitions is announced once rather than once per partition
+local function group_by_drive(partitions)
+	local drives, order = {}, {}
+	for _, p in ipairs(partitions) do
+		if p.main then
+			if not drives[p.main] then
+				drives[p.main], order[#order + 1] = { src = p.main, rows = {} }, p.main
+			end
+			local rows = drives[p.main].rows
+			rows[#rows + 1] = p
+		end
+	end
+	return drives, order
+end
+
+local function has_removable_row(drive)
+	for _, p in ipairs(drive.rows) do
+		-- `removable` comes from /sys/block/<disk>/removable on Linux and from
+		-- DiskArbitration on macOS; `external` is macOS-only
+		if p.removable or p.external then
+			return true
+		end
+	end
+	return false
+end
+
+-- /sys/block/<disk>/removable only reports removable *media*, so USB SATA and
+-- NVMe enclosures report 0. Fall back to asking lsblk for the transport.
+local function usb_transports(mains)
+	local map = {}
+	if ya.target_os() ~= "linux" or #mains == 0 then
+		return map
+	end
+
+	local output = Command("lsblk"):arg({ "-p", "-o", "name,tran", "-J" }):arg(mains):output()
+	-- Parse whatever we got even on failure: lsblk exits non-zero when a single
+	-- device vanished mid-call, but still reports the rest
+	local t = ya.json_decode(output and output.stdout or "")
+	for _, dev in ipairs(t and t.blockdevices or {}) do
+		map[dev.name] = dev.tran
+	end
+	return map
+end
+
+local function drive_label(drive)
+	for _, p in ipairs(drive.rows) do
+		if p.label and p.label ~= "" then
+			return p.label
+		end
+	end
+	return device_basename(drive.src)
+end
+
+local function drive_mount_point(drive)
+	for _, p in ipairs(drive.rows) do
+		if p.dist then
+			return p.dist
+		end
+	end
+end
+
+local function notify_drive(drive, config)
+	local dist = drive_mount_point(drive)
+	if dist then
+		if config.notify_opts.mounted then
+			ya.notify {
+				title = "Mega Mount",
+				content = string.format("Drive `%s` detected.\nMounted at `%s`.", drive_label(drive), dist),
+				timeout = 8,
+			}
+		end
+		return
+	end
+
+	-- The keybind opens this plugin's window; it doesn't mount on its own, so
+	-- don't promise that it will
+	local keybind = config.notify_opts.keybind
+	ya.notify {
+		title = "Mega Mount",
+		content = string.format(
+			-- Yazi sizes the toast from the longest line, so a break here
+			-- keeps it compact rather than one wide strip
+			"Drive `%s` detected.\n%s",
+			drive_label(drive),
+			keybind and string.format("Press `%s` to open Mega Mount.", keybind)
+				or "Open Mega Mount to mount it."
+		),
+		timeout = 8,
+	}
+end
+
+-- Announce removable drives that weren't attached the last time we looked.
+-- Takes the already-filtered rows from `obtain()`, so drives hidden by the
+-- `exclude_*` options stay silent too.
+function M.notify_new_drives(partitions)
+	local config = get_config()
+	if not config.notify_opts.enabled then
+		return
+	end
+
+	local drives, order = group_by_drive(partitions)
+	local known = load_seen()
+
+	-- A device path's removability doesn't change while it stays attached, so
+	-- carry old verdicts over and only shell out to lsblk for drives we've
+	-- neither seen before nor can classify from the kernel's own flags
+	local current, unknown = {}, {}
+	for _, src in ipairs(order) do
+		if known and known[src] ~= nil then
+			current[src] = known[src]
+		elseif has_removable_row(drives[src]) then
+			current[src] = true
+		else
+			unknown[#unknown + 1] = src
+		end
+	end
+
+	if #unknown > 0 then
+		local transports = usb_transports(unknown)
+		for _, src in ipairs(unknown) do
+			current[src] = transports[src] == "usb"
+		end
+	end
+
+	-- Holds only the drives attached right now, so a replug counts as new again
+	save_seen(current)
+
+	-- First pass of the session: record what's already attached, stay quiet
+	if not known then
+		return
+	end
+
+	for _, src in ipairs(order) do
+		if current[src] and known[src] == nil then
+			notify_drive(drives[src], config)
+		end
+	end
+end
+
 function M:setup(opts)
 	opts = opts or {}
 	if opts.keys then
@@ -288,14 +468,33 @@ function M:setup(opts)
 	if opts.show_help ~= nil then
 		M.show_help = opts.show_help
 	end
-	
+	if opts.notify ~= nil then
+		M.notify_opts.enabled = opts.notify
+	end
+	if opts.notify_keybind then
+		M.notify_opts.keybind = opts.notify_keybind
+	end
+	if opts.notify_mounted ~= nil then
+		M.notify_opts.mounted = opts.notify_mounted
+	end
+
 	-- Save config to sync context so it persists across plugin invocations
 	save_config({
 		symlink_opts = M.symlink_opts,
 		filter_opts = M.filter_opts,
 		show_help = M.show_help,
+		notify_opts = M.notify_opts,
 		user_keys = M.user_keys,
 	})
+
+	-- Subscribe at startup rather than when the UI opens, so drive changes are
+	-- seen while Mega Mount is closed
+	subscribe()
+	if M.notify_opts.enabled then
+		-- Record the drives attached at startup; without this first pass the
+		-- next insertion would be mistaken for the baseline and go unannounced
+		ya.emit("plugin", { M._id, "refresh" })
+	end
 end
 
 local function get_key(action)
@@ -310,19 +509,40 @@ local function get_key(action)
 	return DEFAULT_KEYS[action]
 end
 
-local function build_help_line()
+-- `state` describes what the row under the cursor can do, so the hints track
+-- the hovered drive: the smart action is named for what it would actually do,
+-- and keys that would be rejected are dimmed.
+local function build_help_line(state)
+	-- Nil state means nothing is listed at all, so every operation bails before
+	-- it starts -- `quit` is the only key left that does anything
+	local empty = state == nil
 	local hints = {
-		{ key = get_key("enter"), action = "mount/eject" },
-		{ key = get_key("mount"), action = "mount" },
-		{ key = get_key("unmount"), action = "unmount" },
-		{ key = get_key("eject"), action = "eject" },
+		{
+			-- `<Enter>` is bound to this action too, alongside whatever key is
+			-- configured, so name it -- that's what people look for
+			key = get_key("enter") .. "/enter",
+			action = state and state.label or "mount & open",
+			dim = empty or (not state.can_mount and not state.can_unmount),
+		},
+		{ key = get_key("mount"), action = "mount", dim = empty or not state.can_mount },
+		{ key = get_key("unmount"), action = "unmount", dim = empty or not state.can_unmount },
+		-- With a row present, `eject` always applies: unlike mount/unmount it
+		-- has no already-in-that-state guard, and powering off an unmounted
+		-- drive is a normal thing to do
+		{ key = get_key("eject"), action = "eject", dim = empty },
 		{ key = get_key("quit"), action = "quit" },
 	}
 
 	local spans = {}
 	for i, hint in ipairs(hints) do
-		spans[#spans + 1] = ui.Span(hint.key):style(ui.Style():fg("blue"):bold())
-		spans[#spans + 1] = ui.Span(" " .. hint.action)
+		if hint.dim then
+			local dimmed = ui.Style():fg("darkgray")
+			spans[#spans + 1] = ui.Span(hint.key):style(dimmed)
+			spans[#spans + 1] = ui.Span(" " .. hint.action):style(dimmed)
+		else
+			spans[#spans + 1] = ui.Span(hint.key):style(ui.Style():fg("blue"):bold())
+			spans[#spans + 1] = ui.Span(" " .. hint.action)
+		end
 		if i < #hints then
 			spans[#spans + 1] = ui.Span("  ")
 		end
@@ -378,7 +598,9 @@ function M:entry(job)
 	get_config()
 
 	if job.args[1] == "refresh" then
-		return update_partitions(self.obtain())
+		local partitions = self.obtain()
+		update_partitions(partitions)
+		return M.notify_new_drives(partitions)
 	end
 
 	toggle_ui()
@@ -473,8 +695,9 @@ function M:entry(job)
 						ya.emit("cd", { nav_path })
 					end
 					
-					-- Unmount and eject
-					self.operate("unmount")
+					-- Unmount and eject; only the eject reports, so the two
+					-- halves of this one action don't produce two toasts
+					self.operate("unmount", true)
 					self.operate("eject")
 				end
 			elseif run == "eject" then
@@ -488,15 +711,98 @@ end
 
 function M:reflow() return { self } end
 
+local function status_cell(text, color)
+	return ui.Line(ui.Span(text):style(ui.Style():fg(color)))
+end
+
+-- Tally each drive's partitions so a disk row can summarise them. Built from
+-- the rows we already hold, since redraw must not shell out.
+local function drive_tallies(partitions)
+	local tallies = {}
+	for _, p in ipairs(partitions) do
+		if p.main and p.sub then
+			local t = tallies[p.main] or { mountable = 0, mounted = 0 }
+			if p.dist then
+				t.mounted, t.mountable = t.mounted + 1, t.mountable + 1
+			elseif p.fstype and p.fstype ~= "" then
+				t.mountable = t.mountable + 1
+			end
+			tallies[p.main] = t
+		end
+	end
+	return tallies
+end
+
+local function disk_status(tally)
+	if not tally or tally.mountable == 0 then
+		return status_cell("--", "darkgray")
+	elseif tally.mounted == 0 then
+		return status_cell("Unmounted", "darkgray")
+	elseif tally.mounted == tally.mountable then
+		return status_cell("Mounted", "green")
+	end
+	return status_cell(string.format("%d/%d", tally.mounted, tally.mountable), "yellow")
+end
+
+local function partition_status(p)
+	if p.dist then
+		return status_cell("Mounted", "green")
+	elseif not p.fstype or p.fstype == "" then
+		return status_cell("No FS", "darkgray")
+	end
+	return status_cell("Unmounted", "darkgray")
+end
+
+-- What the row under the cursor can have done to it. `can_mount`/`can_unmount`
+-- follow the already-in-that-state guards in `operate`, and `label` mirrors the
+-- `enter` branch in consumer1: a mounted row gets unmounted and ejected, an
+-- unmounted one gets mounted.
+local function hover_state(partitions, cursor, tallies)
+	local active = partitions[(cursor or 0) + 1]
+	if not active then
+		return nil
+	end
+
+	local can_mount, can_unmount
+	if active.sub then
+		local has_fs = active.fstype ~= nil and active.fstype ~= ""
+		can_mount = active.dist == nil and has_fs
+		can_unmount = active.dist ~= nil
+	else
+		-- A drive row aggregates its partitions: still mountable while any
+		-- remain unmounted, still unmountable while any remain mounted
+		local tally = tallies[active.main] or { mountable = 0, mounted = 0 }
+		can_mount = tally.mounted < tally.mountable
+		can_unmount = tally.mounted > 0
+	end
+
+	-- Named for everything the smart action does, so it reads differently from
+	-- the plain `mount` / `unmount` keys: it also navigates and closes the window
+	return {
+		label = can_unmount and "unmount & eject" or "mount & open",
+		can_mount = can_mount,
+		can_unmount = can_unmount,
+	}
+end
+
 function M:redraw()
+	local partitions = self.partitions or {}
+	local tallies = drive_tallies(partitions)
+
 	local rows = {}
-	for _, p in ipairs(self.partitions or {}) do
+	for _, p in ipairs(partitions) do
 		if not p.sub then
-			rows[#rows + 1] = ui.Row { p.main }
+			-- Dist and FSType stay blank on a drive row even when the device
+			-- has them: this plugin's disk actions work on the partitions, so
+			-- showing a whole-disk filesystem here would advertise something
+			-- pressing mount won't do. The label is pure identification.
+			rows[#rows + 1] = ui.Row { p.main, p.label or "", "", "", disk_status(tallies[p.main]) }
 		elseif p.sub == "" then
-			rows[#rows + 1] = ui.Row { p.main, p.label or "", p.dist or "", p.fstype or "" }
+			rows[#rows + 1] =
+				ui.Row { p.main, p.label or "", p.dist or "", p.fstype or "", partition_status(p) }
 		else
-			rows[#rows + 1] = ui.Row { "  " .. p.sub, p.label or "", p.dist or "", p.fstype or "" }
+			rows[#rows + 1] =
+				ui.Row { "  " .. p.sub, p.label or "", p.dist or "", p.fstype or "", partition_status(p) }
 		end
 	end
 
@@ -509,19 +815,29 @@ function M:redraw()
 			:title(ui.Line("Mega Mount"):align(ui.Align.CENTER)),
 		ui.Table(rows)
 			:area(self._table_area)
-			:header(ui.Row({ "Src", "Label", "Dist", "FSType" }):style(ui.Style():bold()))
+			-- Yazi defaults column spacing to 0, so a value that fills its
+			-- column runs straight into the next one
+			:spacing(2)
+			:header(ui.Row({ "Src", "Label", "Mount Point", "FSType", "Status" }):style(ui.Style():bold()))
 			:row(self.cursor)
 			:row_style(ui.Style():fg("blue"):underline())
 			:widths {
-				ui.Constraint.Length(20),
-				ui.Constraint.Length(20),
-				ui.Constraint.Percentage(70),
+				-- Src holds `/dev/nvme0n1` at its longest, or a bare partition
+				-- number; the width Label borrows from it comes from here
+				ui.Constraint.Length(12),
+				-- Wide enough for a full volume label, e.g. a NixOS ISO's
+				-- `nixos-graphical-26.05-x86_64`
+				ui.Constraint.Length(28),
+				ui.Constraint.Fill(1),
+				ui.Constraint.Length(10),
 				ui.Constraint.Length(10),
 			},
 	}
 
 	if M.show_help and self._help_area then
-		elements[#elements + 1] = ui.Text({ build_help_line() }):area(self._help_area)
+		elements[#elements + 1] = ui.Text({
+			build_help_line(hover_state(partitions, self.cursor, tallies)),
+		}):area(self._help_area)
 	end
 
 	return elements
@@ -668,14 +984,23 @@ function M.split(src)
 	end
 end
 
+-- Fill in details Yazi didn't supply for unmounted partitions. It only learns
+-- the filesystem type from /proc/mounts, and resolves labels from
+-- /dev/disk/by-label at the moment it snapshots the partition table -- which
+-- for a freshly inserted drive can beat udev to creating those symlinks,
+-- leaving the label blank until some later rescan. lsblk is read live, so it
+-- has both.
 function M.fillin(tbl)
 	if ya.target_os() ~= "linux" then
 		return tbl
 	end
 
+	-- Drive rows are included too: a whole-disk device can carry a filesystem
+	-- and label of its own (a hybrid ISO written to a stick, say), and Yazi
+	-- leaves those blank just as it does for partitions
 	local sources, indices = {}, {}
 	for i, p in ipairs(tbl) do
-		if p.sub and not p.fstype then
+		if not p.fstype or not p.label then
 			sources[#sources + 1], indices[p.src] = p.src, i
 		end
 	end
@@ -683,15 +1008,20 @@ function M.fillin(tbl)
 		return tbl
 	end
 
-	local output, err = Command("lsblk"):arg({ "-p", "-o", "name,fstype", "-J" }):arg(sources):output()
+	local output, err = Command("lsblk"):arg({ "-p", "-o", "name,fstype,label", "-J" }):arg(sources):output()
 	if err then
-		ya.dbg("Failed to fetch filesystem types for unmounted partitions: " .. err)
+		ya.dbg("Failed to fetch filesystem details for unmounted partitions: " .. err)
 		return tbl
 	end
 
 	local t = ya.json_decode(output and output.stdout or "")
 	for _, p in ipairs(t and t.blockdevices or {}) do
-		tbl[indices[p.name]].fstype = p.fstype
+		local row = indices[p.name] and tbl[indices[p.name]]
+		if row then
+			-- Keep anything Yazi already resolved; only fill the gaps
+			row.fstype = row.fstype or p.fstype
+			row.label = row.label or p.label
+		end
 	end
 	return tbl
 end
@@ -733,8 +1063,10 @@ function M.get_disk_partitions(disk_src)
 end
 
 -- Operate on an entire disk (mount/unmount/eject all partitions)
-function M.operate_disk(type, disk)
+function M.operate_disk(type, disk, quiet)
 	local partitions = M.get_disk_partitions(disk.src)
+	local name = device_basename(disk.src)
+	local PAST = { mount = "Mounted", unmount = "Unmounted", eject = "Ejected" }
 
 	if ya.target_os() == "macos" then
 		local output, err
@@ -749,6 +1081,8 @@ function M.operate_disk(type, disk)
 			M.fail("Failed to %s disk `%s`: %s", type, disk.src, err)
 		elseif not output.status.success then
 			M.fail("Failed to %s disk `%s`: %s", type, disk.src, output.stderr)
+		elseif not quiet then
+			notify_ok("%s disk `%s`.", PAST[type] or type, name)
 		end
 		return
 	end
@@ -788,9 +1122,11 @@ function M.operate_disk(type, disk)
 			local nav_path = nil
 			if next(mounted_sources) then
 				-- Fetch fresh partition info to get mount points
+				local count, first = 0, nil
 				for _, p in ipairs(fs.partitions()) do
 					if mounted_sources[p.src] and p.dist then
 						create_symlink(p)
+						count, first = count + 1, first or p
 						-- Set navigation path (prefer symlink if created)
 						if not nav_path then
 							local symlink_path = get_symlink_path(p)
@@ -802,6 +1138,11 @@ function M.operate_disk(type, disk)
 							end
 						end
 					end
+				end
+				if not quiet and count == 1 then
+					notify_ok("Mounted `%s`\nat `%s`.", display_name(first), first.dist)
+				elseif not quiet and count > 1 then
+					notify_ok("Mounted %d partitions on `%s`.", count, name)
 				end
 				return nav_path
 			else
@@ -824,18 +1165,24 @@ function M.operate_disk(type, disk)
 			end
 
 			-- Unmount all mounted partitions
-			local errors = {}
+			local errors, unmounted, last = {}, 0, nil
 			for _, p in ipairs(partitions) do
 				if p.dist then
 					remove_symlink(p)
 					local output = Command("udisksctl"):arg({ "unmount", "-b", p.src }):output()
 					if not output or not output.status.success then
 						errors[#errors + 1] = p.src
+					else
+						unmounted, last = unmounted + 1, p
 					end
 				end
 			end
 			if #errors > 0 then
 				M.fail("Failed to unmount: %s", table.concat(errors, ", "))
+			elseif not quiet and unmounted == 1 then
+				notify_ok("Unmounted `%s`.", display_name(last))
+			elseif not quiet and unmounted > 1 then
+				notify_ok("Unmounted %d partitions on `%s`.", unmounted, name)
 			end
 		elseif type == "eject" then
 			-- Unmount all mounted partitions first
@@ -851,18 +1198,22 @@ function M.operate_disk(type, disk)
 				M.fail("Failed to eject disk `%s`: %s", disk.src, err)
 			elseif not output.status.success then
 				M.fail("Failed to eject disk `%s`: %s", disk.src, output.stderr)
+			elseif not quiet then
+				notify_ok("Ejected `%s` -- safe to remove.", name)
 			end
 		end
 	end
 end
 
-function M.operate(type)
+-- `quiet` suppresses the success notification, so a combined unmount+eject
+-- reports once rather than twice
+function M.operate(type, quiet)
 	local active = active_partition()
 	if not active then
 		return nil
 	elseif not active.sub then
 		-- Operating on entire disk
-		return M.operate_disk(type, active)
+		return M.operate_disk(type, active, quiet)
 	end
 
 	-- Check if partition is already in the desired state
@@ -873,6 +1224,9 @@ function M.operate(type)
 		ya.notify { title = "Mega Mount", content = "Partition `" .. active.src .. "` is already unmounted", timeout = 5, level = "warn" }
 		return nil
 	end
+
+	-- Capture the name now; after unmounting the label is no longer reported
+	local name = display_name(active)
 
 	-- For unmount/eject, remove symlink before the operation
 	local should_remove_symlink = (type == "unmount" or type == "eject") and active.dist
@@ -909,6 +1263,12 @@ function M.operate(type)
 		for _, p in ipairs(partitions) do
 			if p.src == active.src and p.dist then
 				create_symlink(p)
+				if not quiet then
+					-- Broken across lines deliberately: Yazi sizes the toast from
+					-- its longest line, and a label plus its mount path on one
+					-- line forces a full-width box
+					notify_ok("Mounted `%s`\nat `%s`.", display_name(p), p.dist)
+				end
 				-- Return navigation path (prefer symlink if created)
 				local symlink_path = get_symlink_path(p)
 				local config = get_config()
@@ -919,6 +1279,14 @@ function M.operate(type)
 				end
 			end
 		end
+		-- udisksctl reported success but no mount point showed up
+		if not quiet then
+			notify_ok("Mounted `%s`.", name)
+		end
+	elseif not quiet and type == "unmount" then
+		notify_ok("Unmounted `%s`.", name)
+	elseif not quiet and type == "eject" then
+		notify_ok("Ejected `%s` -- safe to remove.", name)
 	end
 	return nil
 end
